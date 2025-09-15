@@ -46,13 +46,23 @@ COLAB_ENV = mount_google_drive()
 
 def create_checkpoint_directory():
     """Create checkpoint directory in Google Drive if in Colab, otherwise locally"""
-    if COLAB_ENV:
-        checkpoint_dir = '/content/drive/MyDrive/banglabert_checkpoints/'
+    # First check if Google Drive path exists (even if mounting failed)
+    drive_path = '/content/drive/MyDrive/banglabert_checkpoints/'
+    local_path = './checkpoints/'
+    
+    # Check if Google Drive directory exists and has checkpoints
+    if os.path.exists(drive_path) and os.listdir(drive_path):
+        checkpoint_dir = drive_path
+        print(f"📁 Using existing Google Drive checkpoints: {checkpoint_dir}")
+        COLAB_ENV = True  # Force Colab mode if checkpoints exist there
+    elif COLAB_ENV:
+        checkpoint_dir = drive_path
+        print(f"📁 Checkpoint directory created: {checkpoint_dir}")
     else:
-        checkpoint_dir = './checkpoints/'
+        checkpoint_dir = local_path
+        print(f"📁 Checkpoint directory created: {checkpoint_dir}")
     
     os.makedirs(checkpoint_dir, exist_ok=True)
-    print(f" Checkpoint directory created: {checkpoint_dir}")
     return checkpoint_dir
 
 def save_checkpoint(epoch, model, optimizer, scheduler, fold, val_f1, train_loss, config, checkpoint_dir):
