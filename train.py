@@ -12,14 +12,37 @@ import os
 import json
 
 # Google Drive mounting for Colab
-try:
-    from google.colab import drive
-    drive.mount('/content/drive')
-    COLAB_ENV = True
-    print("✅ Google Drive mounted successfully")
-except ImportError:
-    COLAB_ENV = False
-    print("ℹ️  Not running in Colab environment")
+def is_colab_environment():
+    """Check if running in Google Colab environment"""
+    try:
+        import google.colab
+        import IPython
+        # Check if we have the necessary Colab infrastructure
+        if hasattr(IPython, 'get_ipython') and IPython.get_ipython() is not None:
+            return True
+        return False
+    except ImportError:
+        return False
+
+def mount_google_drive():
+    """Mount Google Drive with proper error handling"""
+    try:
+        if is_colab_environment():
+            from google.colab import drive
+            print(" Mounting Google Drive...")
+            drive.mount('/content/drive')
+            print(" Google Drive mounted successfully")
+            return True
+        else:
+            print("  Not running in Colab environment - skipping Google Drive mount")
+            return False
+    except Exception as e:
+        print(f"  Google Drive mounting failed: {e}")
+        print("  Continuing with local checkpoint storage")
+        return False
+
+# Initialize Google Drive mounting
+COLAB_ENV = mount_google_drive()
 
 def create_checkpoint_directory():
     """Create checkpoint directory in Google Drive if in Colab, otherwise locally"""
@@ -29,7 +52,7 @@ def create_checkpoint_directory():
         checkpoint_dir = './checkpoints/'
     
     os.makedirs(checkpoint_dir, exist_ok=True)
-    print(f"📁 Checkpoint directory created: {checkpoint_dir}")
+    print(f" Checkpoint directory created: {checkpoint_dir}")
     return checkpoint_dir
 
 def save_checkpoint(epoch, model, optimizer, scheduler, fold, val_f1, train_loss, config, checkpoint_dir):
@@ -63,12 +86,12 @@ def save_checkpoint(epoch, model, optimizer, scheduler, fold, val_f1, train_loss
     with open(metadata_path, 'w') as f:
         json.dump(metadata, f, indent=2)
     
-    print(f"💾 Checkpoint saved: {checkpoint_path}")
+    print(f" Checkpoint saved: {checkpoint_path}")
     return checkpoint_path
 
 def load_checkpoint(checkpoint_path, model, optimizer, scheduler, device):
     """Load training checkpoint and return state"""
-    print(f"📂 Loading checkpoint: {checkpoint_path}")
+    print(f" Loading checkpoint: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=device)
     
     model.load_state_dict(checkpoint['model_state_dict'])
@@ -104,14 +127,14 @@ def should_resume_from_checkpoint(checkpoint_dir, fold, config):
     latest_epoch, checkpoint_path = find_latest_checkpoint(checkpoint_dir, fold)
     
     if checkpoint_path and latest_epoch < config.num_epochs:
-        print(f"🔄 Found checkpoint for fold {fold}, epoch {latest_epoch}")
+        print(f" Found checkpoint for fold {fold}, epoch {latest_epoch}")
         print(f"   Resuming from epoch {latest_epoch + 1}")
         return True, checkpoint_path, latest_epoch
     elif checkpoint_path and latest_epoch >= config.num_epochs:
-        print(f"✅ Fold {fold} already completed (epoch {latest_epoch})")
+        print(f" Fold {fold} already completed (epoch {latest_epoch})")
         return False, checkpoint_path, latest_epoch
     else:
-        print(f"🆕 No checkpoint found for fold {fold}, starting fresh")
+        print(f" No checkpoint found for fold {fold}, starting fresh")
         return False, None, None
 
 def calculate_class_weights(labels):
