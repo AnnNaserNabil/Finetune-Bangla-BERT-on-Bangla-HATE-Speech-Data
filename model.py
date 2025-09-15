@@ -59,25 +59,41 @@ class BertMultiLabelClassifier(nn.Module):
                 # Extract and validate emotion labels
                 emotion_labels = labels[:, 1].long()
                 
+                # Comprehensive debugging
+                print(f"🔍 Debug - Emotion labels stats:")
+                print(f"   Shape: {emotion_labels.shape}")
+                print(f"   Min: {emotion_labels.min().item()}")
+                print(f"   Max: {emotion_labels.max().item()}")
+                print(f"   Unique: {torch.unique(emotion_labels).tolist()}")
+                print(f"   Dtype: {emotion_labels.dtype}")
+                
                 # Ensure labels are within valid range [0, 2] for 3 emotion classes
                 emotion_labels = torch.clamp(emotion_labels, 0, 2)
                 
-                # Additional validation to prevent CUDA errors
+                # Final validation after clamping
                 if torch.any(emotion_labels < 0) or torch.any(emotion_labels >= 3):
-                    # This should not happen after clamping, but add safety check
-                    print(f"⚠️  Warning: Invalid emotion labels still present after clamping")
+                    print(f"❌ CRITICAL: Invalid labels still present after clamping!")
                     print(f"   Min: {emotion_labels.min().item()}, Max: {emotion_labels.max().item()}")
-                    # Force valid labels
-                    emotion_labels = torch.clamp(emotion_labels, 0, 2)
+                    # Emergency fix - set all invalid labels to 0
+                    emotion_labels = torch.where(emotion_labels < 0, torch.zeros_like(emotion_labels), emotion_labels)
+                    emotion_labels = torch.where(emotion_labels >= 3, torch.full_like(emotion_labels, 2), emotion_labels)
+                    print(f"   Emergency fix applied - new range: [{emotion_labels.min().item()}, {emotion_labels.max().item()}]")
                 
                 # Ensure logits and labels have compatible shapes
                 emotion_logits = logits[:, 1:]  # Should be [batch_size, 3]
+                print(f"   Emotion logits shape: {emotion_logits.shape}")
+                print(f"   Emotion labels shape: {emotion_labels.shape}")
                 
-                # Compute emotion loss
-                emotion_loss = emotion_loss_fct(emotion_logits, emotion_labels)
-                
-                # Combined loss with weights
-                loss = self.config.hate_speech_loss_weight * hate_loss + self.config.emotion_loss_weight * emotion_loss
+                # One final safety check before computing loss
+                if torch.any(emotion_labels < 0) or torch.any(emotion_labels >= 3):
+                    print(f"🚨 EMERGENCY: Using fallback to prevent crash")
+                    # Use only hate speech loss if emotion labels are still invalid
+                    loss = hate_loss
+                else:
+                    # Compute emotion loss only if labels are valid
+                    emotion_loss = emotion_loss_fct(emotion_logits, emotion_labels)
+                    # Combined loss with weights
+                    loss = self.config.hate_speech_loss_weight * hate_loss + self.config.emotion_loss_weight * emotion_loss
             else:
                 # Fallback to BCE for multi-label
                 loss_fct = nn.BCEWithLogitsLoss()
