@@ -122,12 +122,12 @@ def evaluate_model(model, dataloader, device):
 def run_kfold_training(config, comments, labels, tokenizer, device):
     mlflow.set_experiment(config.mlflow_experiment_name)
     
-    with mlflow.start_run(run_name=f"{config.author_name}_{config.batch}_{config.lr}_{config.epochs}"):
+    with mlflow.start_run(run_name=f"{config.author_name}_{config.batch_size}_{config.learning_rate}_{config.num_epochs}"):
         # Log parameters
         mlflow.log_params({
-            'batch_size': config.batch,
-            'learning_rate': config.lr,
-            'num_epochs': config.epochs,
+            'batch_size': config.batch_size,
+            'learning_rate': config.learning_rate,
+            'num_epochs': config.num_epochs,
             'num_folds': config.num_folds,
             'max_length': config.max_length,
             'freeze_base': config.freeze_base,
@@ -155,13 +155,15 @@ def run_kfold_training(config, comments, labels, tokenizer, device):
                 config.max_length, augment=False
             )
 
-            train_loader = DataLoader(train_dataset, batch_size=config.batch, shuffle=True)
-            val_loader = DataLoader(val_dataset, batch_size=config.batch, shuffle=False)
+            train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True)
+            val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False)
 
             model = BertMultiLabelClassifier(
                 config.model_path, 
                 len(data.LABEL_COLUMNS), 
-                dropout=config.dropout
+                dropout=config.dropout,
+                multi_task=True,
+                config=config
             )
             
             if config.freeze_base:
@@ -170,23 +172,32 @@ def run_kfold_training(config, comments, labels, tokenizer, device):
 
             optimizer = AdamW(
                 model.parameters(), 
-                lr=config.lr, 
+                lr=config.learning_rate, 
                 weight_decay=0.01, 
                 eps=1e-8
             )
             
-            total_steps = len(train_loader) * config.epochs
-            scheduler = get_cosine_schedule_with_warmup(
-                optimizer, 
-                num_warmup_steps=int(0.1 * total_steps), 
-                num_training_steps=total_steps
-            )
+            total_steps = len(train_loader) * config.num_epochs
+            
+            # Dynamic scheduler selection based on config
+            if config.scheduler_type == "cosine":
+                scheduler = get_cosine_schedule_with_warmup(
+                    optimizer, 
+                    num_warmup_steps=int(0.1 * total_steps), 
+                    num_training_steps=total_steps
+                )
+            else:
+                scheduler = get_linear_schedule_with_warmup(
+                    optimizer, 
+                    num_warmup_steps=config.warmup_steps, 
+                    num_training_steps=total_steps
+                )
 
             best_f1 = 0
-            patience = 10  # Increased patience
+            patience = config.early_stopping_patience  # Use config value
             patience_counter = 0
 
-            for epoch in range(config.epochs):
+            for epoch in range(config.num_epochs):
                 train_loss = train_epoch(model, train_loader, optimizer, scheduler, device, class_weights)
                 val_metrics = evaluate_model(model, val_loader, device)
                 

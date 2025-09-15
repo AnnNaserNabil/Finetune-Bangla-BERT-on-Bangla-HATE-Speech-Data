@@ -2,9 +2,11 @@ import torch.nn as nn
 from transformers import BertModel, BertConfig
 
 class BertMultiLabelClassifier(nn.Module):
-    def __init__(self, model_name, num_labels, dropout=0.3):
+    def __init__(self, model_name, num_labels, dropout=0.3, multi_task=False, config=None):
         super(BertMultiLabelClassifier, self).__init__()
         self.bert = BertModel.from_pretrained(model_name)
+        self.multi_task = multi_task
+        self.config = config
         
         # Enhanced classifier with multiple layers and better regularization
         self.classifier = nn.Sequential(
@@ -45,17 +47,34 @@ class BertMultiLabelClassifier(nn.Module):
         loss = None
         if labels is not None:
             # Use different loss functions for different tasks
-            if labels.shape[1] == 2:  # HateSpeech + Emotion
+            if self.multi_task:
                 # Binary cross entropy for HateSpeech
                 hate_loss_fct = nn.BCEWithLogitsLoss()
                 hate_loss = hate_loss_fct(logits[:, :1], labels[:, :1])
                 
                 # Cross entropy for Emotion (multi-class)
                 emotion_loss_fct = nn.CrossEntropyLoss()
-                emotion_loss = emotion_loss_fct(logits[:, 1:], labels[:, 1].long())
+                
+                # Validate emotion labels before computing loss
+                emotion_labels = labels[:, 1].long()
+                
+                # Debug: Check for invalid labels
+                if torch.any(emotion_labels < 0) or torch.any(emotion_labels >= 3):
+                    print(f"❌ Invalid emotion labels detected!")
+                    print(f"   Min label: {emotion_labels.min().item()}")
+                    print(f"   Max label: {emotion_labels.max().item()}")
+                    print(f"   Unique labels: {torch.unique(emotion_labels).tolist()}")
+                    print(f"   Label shape: {emotion_labels.shape}")
+                    print(f"   Logits shape: {logits[:, 1:].shape}")
+                    
+                    # Fix invalid labels by clipping to valid range
+                    emotion_labels = torch.clamp(emotion_labels, 0, 2)
+                    print(f"   Fixed labels - clipped to range [0, 2]")
+                
+                emotion_loss = emotion_loss_fct(logits[:, 1:], emotion_labels)
                 
                 # Combined loss with weights
-                loss = 0.6 * hate_loss + 0.4 * emotion_loss
+                loss = self.config.hate_speech_loss_weight * hate_loss + self.config.emotion_loss_weight * emotion_loss
             else:
                 # Fallback to BCE for multi-label
                 loss_fct = nn.BCEWithLogitsLoss()
