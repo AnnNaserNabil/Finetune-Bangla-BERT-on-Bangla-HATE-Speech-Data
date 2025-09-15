@@ -56,23 +56,25 @@ class BertMultiLabelClassifier(nn.Module):
                 # Cross entropy for Emotion (multi-class)
                 emotion_loss_fct = nn.CrossEntropyLoss()
                 
-                # Validate emotion labels before computing loss
+                # Extract and validate emotion labels
                 emotion_labels = labels[:, 1].long()
                 
-                # Debug: Check for invalid labels
-                if torch.any(emotion_labels < 0) or torch.any(emotion_labels >= 3):
-                    print(f"❌ Invalid emotion labels detected!")
-                    print(f"   Min label: {emotion_labels.min().item()}")
-                    print(f"   Max label: {emotion_labels.max().item()}")
-                    print(f"   Unique labels: {torch.unique(emotion_labels).tolist()}")
-                    print(f"   Label shape: {emotion_labels.shape}")
-                    print(f"   Logits shape: {logits[:, 1:].shape}")
-                    
-                    # Fix invalid labels by clipping to valid range
-                    emotion_labels = torch.clamp(emotion_labels, 0, 2)
-                    print(f"   Fixed labels - clipped to range [0, 2]")
+                # Ensure labels are within valid range [0, 2] for 3 emotion classes
+                emotion_labels = torch.clamp(emotion_labels, 0, 2)
                 
-                emotion_loss = emotion_loss_fct(logits[:, 1:], emotion_labels)
+                # Additional validation to prevent CUDA errors
+                if torch.any(emotion_labels < 0) or torch.any(emotion_labels >= 3):
+                    # This should not happen after clamping, but add safety check
+                    print(f"⚠️  Warning: Invalid emotion labels still present after clamping")
+                    print(f"   Min: {emotion_labels.min().item()}, Max: {emotion_labels.max().item()}")
+                    # Force valid labels
+                    emotion_labels = torch.clamp(emotion_labels, 0, 2)
+                
+                # Ensure logits and labels have compatible shapes
+                emotion_logits = logits[:, 1:]  # Should be [batch_size, 3]
+                
+                # Compute emotion loss
+                emotion_loss = emotion_loss_fct(emotion_logits, emotion_labels)
                 
                 # Combined loss with weights
                 loss = self.config.hate_speech_loss_weight * hate_loss + self.config.emotion_loss_weight * emotion_loss
