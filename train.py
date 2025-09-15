@@ -1,5 +1,5 @@
 # =========================
-# train.py  (clean, robust)
+# train.py  (space-safe checkpoints)
 # =========================
 
 import os
@@ -97,8 +97,37 @@ def create_checkpoint_directory(base_dir=None) -> str:
 # -----------------------------
 # Checkpoint helpers
 # -----------------------------
+def _best_ckpt_path(checkpoint_dir: str, fold: int) -> str:
+    """Fixed best-checkpoint filename per fold."""
+    return os.path.join(checkpoint_dir, f'best_fold_{fold}.pth')
+
+
+def _delete_old_pths_for_fold(checkpoint_dir: str, fold: int, keep_path: str | None = None):
+    """
+    Delete all .pth files for a given fold except `keep_path`.
+    Keeps JSON metadata files intact.
+    """
+    if not os.path.isdir(checkpoint_dir):
+        return
+    for fname in os.listdir(checkpoint_dir):
+        if not fname.endswith('.pth'):
+            continue
+        # Match both old pattern and new best_ pattern
+        if fname.startswith(f'checkpoint_fold_{fold}_epoch_') or fname == f'best_fold_{fold}.pth':
+            full = os.path.join(checkpoint_dir, fname)
+            if keep_path is not None and os.path.abspath(full) == os.path.abspath(keep_path):
+                continue
+            try:
+                os.remove(full)
+            except Exception as e:
+                print(f"  Warning: could not delete {full}: {e}")
+
+
 def save_checkpoint(epoch, model, optimizer, scheduler, fold, val_f1, train_loss, config_obj, checkpoint_dir):
-    """Save training checkpoint with all necessary state."""
+    """
+    Save only the latest/best .pth for this fold (overwriting/deleting older .pth files),
+    but ALWAYS append a JSON metadata file per improved epoch to keep history.
+    """
     checkpoint = {
         'epoch': int(epoch),
         'model_state_dict': model.state_dict(),
@@ -111,25 +140,33 @@ def save_checkpoint(epoch, model, optimizer, scheduler, fold, val_f1, train_loss
         'timestamp': str(np.datetime64('now'))
     }
 
-    ckpt_name = f'checkpoint_fold_{fold}_epoch_{epoch}.pth'
-    checkpoint_path = os.path.join(checkpoint_dir, ckpt_name)
-    torch.save(checkpoint, checkpoint_path)
+    # Fixed best path per fold
+    best_path = _best_ckpt_path(checkpoint_dir, fold)
 
-    # Also save a metadata JSON for quick inspection
+    # First, delete any previous .pth files for this fold (will also remove old best if present)
+    _delete_old_pths_for_fold(checkpoint_dir, fold, keep_path=None)
+
+    # Now save the new best
+    torch.save(checkpoint, best_path)
+    print(f" Checkpoint saved (best for fold {fold}): {best_path}")
+
+    # Also save a metadata JSON for this improved epoch (do NOT delete old JSONs)
     metadata = {
         'fold': int(fold),
         'epoch': int(epoch),
         'val_f1': float(val_f1),
         'train_loss': float(train_loss),
-        'checkpoint_path': checkpoint_path,
+        'checkpoint_path': best_path,  # current best
         'timestamp': checkpoint['timestamp']
     }
     metadata_path = os.path.join(checkpoint_dir, f'metadata_fold_{fold}_epoch_{epoch}.json')
-    with open(metadata_path, 'w') as f:
-        json.dump(metadata, f, indent=2)
+    try:
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata, f, indent=2)
+    except Exception as e:
+        print(f"  Warning: could not write metadata JSON {metadata_path}: {e}")
 
-    print(f" Checkpoint saved: {checkpoint_path}")
-    return checkpoint_path
+    return best_path
 
 
 def load_checkpoint(checkpoint_path, model, optimizer, scheduler, device):
@@ -150,23 +187,44 @@ def load_checkpoint(checkpoint_path, model, optimizer, scheduler, device):
     }
 
 
-def find_latest_checkpoint(checkpoint_dir, fold):
-    """Find the latest checkpoint for a specific fold by max epoch number."""
+def _find_latest_legacy_checkpoint(checkpoint_dir: str, fold: int):
+    """Back-compat: if old per-epoch files exist, pick the highest epoch."""
     pattern = f'checkpoint_fold_{fold}_epoch_'
-    checkpoints = []
-
+    best = None
     if os.path.exists(checkpoint_dir):
         for file in os.listdir(checkpoint_dir):
             if file.startswith(pattern) and file.endswith('.pth'):
                 try:
                     epoch = int(file.split('_')[-1].split('.')[0])
-                    checkpoints.append((epoch, os.path.join(checkpoint_dir, file)))
+                    path = os.path.join(checkpoint_dir, file)
+                    if (best is None) or (epoch > best[0]):
+                        best = (epoch, path)
                 except ValueError:
                     continue
+    return best  # (epoch, path) or None
 
-    if checkpoints:
-        latest_epoch, latest_path = max(checkpoints, key=lambda x: x[0])
-        return latest_epoch, latest_path
+
+def find_latest_checkpoint(checkpoint_dir, fold):
+    """
+    Find the resume checkpoint for a fold.
+    Preference:
+      1) New scheme: best_fold_{fold}.pth
+      2) Legacy scheme: highest epoch checkpoint_fold_{fold}_epoch_*.pth
+    Returns (epoch, path) or (None, None)
+    """
+    best_path = _best_ckpt_path(checkpoint_dir, fold)
+    if os.path.exists(best_path):
+        # Read epoch from file contents for accuracy
+        try:
+            ckpt = torch.load(best_path, map_location='cpu')
+            return int(ckpt.get('epoch', 0)), best_path
+        except Exception:
+            # Fallback: unknown epoch, still resume from best
+            return None, best_path
+
+    legacy = _find_latest_legacy_checkpoint(checkpoint_dir, fold)
+    if legacy is not None:
+        return legacy[0], legacy[1]
     return None, None
 
 
@@ -174,11 +232,12 @@ def should_resume_from_checkpoint(checkpoint_dir, fold, config_obj):
     """Decide whether to resume from an existing checkpoint."""
     latest_epoch, checkpoint_path = find_latest_checkpoint(checkpoint_dir, fold)
 
-    if checkpoint_path and latest_epoch < config_obj.num_epochs:
-        print(f" Found checkpoint for fold {fold}, epoch {latest_epoch}")
-        print(f"   Resuming from epoch {latest_epoch + 1}")
+    if checkpoint_path and (latest_epoch is None or latest_epoch < config_obj.num_epochs):
+        ep_info = "unknown" if latest_epoch is None else latest_epoch
+        print(f" Found checkpoint for fold {fold}, epoch {ep_info}")
+        print(f"   Resuming from epoch {(0 if latest_epoch is None else latest_epoch + 1)}")
         return True, checkpoint_path, latest_epoch
-    elif checkpoint_path and latest_epoch >= config_obj.num_epochs:
+    elif checkpoint_path and latest_epoch is not None and latest_epoch >= config_obj.num_epochs:
         print(f" Fold {fold} already completed (epoch {latest_epoch})")
         return False, checkpoint_path, latest_epoch
     else:
