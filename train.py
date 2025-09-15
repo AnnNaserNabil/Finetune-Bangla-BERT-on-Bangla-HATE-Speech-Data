@@ -1,7 +1,3 @@
-# import sys, os
-# sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-# print(sys.path)
-
 import data
 from model import BertMultiLabelClassifier, freeze_base_layers, unfreeze_all_layers
 import torch
@@ -12,6 +8,111 @@ from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_sc
 import numpy as np
 from tqdm import tqdm
 import mlflow
+import os
+import json
+
+# Google Drive mounting for Colab
+try:
+    from google.colab import drive
+    drive.mount('/content/drive')
+    COLAB_ENV = True
+    print("✅ Google Drive mounted successfully")
+except ImportError:
+    COLAB_ENV = False
+    print("ℹ️  Not running in Colab environment")
+
+def create_checkpoint_directory():
+    """Create checkpoint directory in Google Drive if in Colab, otherwise locally"""
+    if COLAB_ENV:
+        checkpoint_dir = '/content/drive/MyDrive/banglabert_checkpoints/'
+    else:
+        checkpoint_dir = './checkpoints/'
+    
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    print(f"📁 Checkpoint directory created: {checkpoint_dir}")
+    return checkpoint_dir
+
+def save_checkpoint(epoch, model, optimizer, scheduler, fold, val_f1, train_loss, config, checkpoint_dir):
+    """Save training checkpoint with all necessary state"""
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'fold': fold,
+        'val_f1': val_f1,
+        'train_loss': train_loss,
+        'config': config.__dict__ if hasattr(config, '__dict__') else config,
+        'timestamp': str(np.datetime64('now'))
+    }
+    
+    checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_fold_{fold}_epoch_{epoch}.pth')
+    torch.save(checkpoint, checkpoint_path)
+    
+    # Also save a metadata file for easy inspection
+    metadata = {
+        'fold': fold,
+        'epoch': epoch,
+        'val_f1': val_f1,
+        'train_loss': train_loss,
+        'checkpoint_path': checkpoint_path,
+        'timestamp': checkpoint['timestamp']
+    }
+    
+    metadata_path = os.path.join(checkpoint_dir, f'metadata_fold_{fold}_epoch_{epoch}.json')
+    with open(metadata_path, 'w') as f:
+        json.dump(metadata, f, indent=2)
+    
+    print(f"💾 Checkpoint saved: {checkpoint_path}")
+    return checkpoint_path
+
+def load_checkpoint(checkpoint_path, model, optimizer, scheduler, device):
+    """Load training checkpoint and return state"""
+    print(f"📂 Loading checkpoint: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    
+    return {
+        'epoch': checkpoint['epoch'],
+        'fold': checkpoint['fold'],
+        'val_f1': checkpoint['val_f1'],
+        'train_loss': checkpoint['train_loss'],
+        'config': checkpoint['config']
+    }
+
+def find_latest_checkpoint(checkpoint_dir, fold):
+    """Find the latest checkpoint for a specific fold"""
+    pattern = f'checkpoint_fold_{fold}_epoch_'
+    checkpoints = []
+    
+    if os.path.exists(checkpoint_dir):
+        for file in os.listdir(checkpoint_dir):
+            if file.startswith(pattern) and file.endswith('.pth'):
+                epoch = int(file.split('_')[-1].split('.')[0])
+                checkpoints.append((epoch, os.path.join(checkpoint_dir, file)))
+    
+    if checkpoints:
+        latest_epoch, latest_path = max(checkpoints, key=lambda x: x[0])
+        return latest_epoch, latest_path
+    return None, None
+
+def should_resume_from_checkpoint(checkpoint_dir, fold, config):
+    """Check if we should resume from existing checkpoint"""
+    latest_epoch, checkpoint_path = find_latest_checkpoint(checkpoint_dir, fold)
+    
+    if checkpoint_path and latest_epoch < config.num_epochs:
+        print(f"🔄 Found checkpoint for fold {fold}, epoch {latest_epoch}")
+        print(f"   Resuming from epoch {latest_epoch + 1}")
+        return True, checkpoint_path, latest_epoch
+    elif checkpoint_path and latest_epoch >= config.num_epochs:
+        print(f"✅ Fold {fold} already completed (epoch {latest_epoch})")
+        return False, checkpoint_path, latest_epoch
+    else:
+        print(f"🆕 No checkpoint found for fold {fold}, starting fresh")
+        return False, None, None
 
 def calculate_class_weights(labels):
     """Calculate balanced class weights"""
@@ -122,6 +223,8 @@ def evaluate_model(model, dataloader, device):
 def run_kfold_training(config, comments, labels, tokenizer, device):
     mlflow.set_experiment(config.mlflow_experiment_name)
     
+    checkpoint_dir = create_checkpoint_directory()
+    
     with mlflow.start_run(run_name=f"{config.author_name}_{config.batch_size}_{config.learning_rate}_{config.num_epochs}"):
         # Log parameters
         mlflow.log_params({
@@ -193,11 +296,20 @@ def run_kfold_training(config, comments, labels, tokenizer, device):
                     num_training_steps=total_steps
                 )
 
-            best_f1 = 0
+            resume_from_checkpoint, checkpoint_path, latest_epoch = should_resume_from_checkpoint(checkpoint_dir, fold, config)
+            
+            if resume_from_checkpoint:
+                checkpoint_state = load_checkpoint(checkpoint_path, model, optimizer, scheduler, device)
+                start_epoch = checkpoint_state['epoch'] + 1
+                best_f1 = checkpoint_state['val_f1']
+            else:
+                start_epoch = 0
+                best_f1 = 0
+            
             patience = config.early_stopping_patience  # Use config value
             patience_counter = 0
 
-            for epoch in range(config.num_epochs):
+            for epoch in range(start_epoch, config.num_epochs):
                 train_loss = train_epoch(model, train_loader, optimizer, scheduler, device, class_weights)
                 val_metrics = evaluate_model(model, val_loader, device)
                 
@@ -208,6 +320,7 @@ def run_kfold_training(config, comments, labels, tokenizer, device):
                     best_f1 = val_metrics['overall_f1']
                     best_metrics = val_metrics.copy()
                     patience_counter = 0
+                    save_checkpoint(epoch, model, optimizer, scheduler, fold, val_metrics['overall_f1'], train_loss, config, checkpoint_dir)
                 else:
                     patience_counter += 1
 
