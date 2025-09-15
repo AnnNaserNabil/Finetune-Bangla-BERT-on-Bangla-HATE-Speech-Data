@@ -2,6 +2,6 @@ transformers==4.44.2  # For BERT model and tokenizer
 torch==2.4.0          # PyTorch for training
 scikit-learn==1.5.1   # Metrics and KFold
 pandas==2.2.2         # Data loading
-numpy==2.0.1          # Arrays and calculations
+numpy>=1.26.0,<2      # Arrays and calculations (compatible with all packages)
 tqdm==4.66.5          # Progress bars
 mlflow==2.15.1        # Experiment tracking
