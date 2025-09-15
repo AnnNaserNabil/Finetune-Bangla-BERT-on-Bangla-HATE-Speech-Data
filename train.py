@@ -3,7 +3,7 @@
 # print(sys.path)
 
 import data
-from model import BertMultiLabelClassifier
+from model import BertMultiLabelClassifier, freeze_base_layers
 import torch
 from torch.utils.data import DataLoader
 from transformers import get_linear_schedule_with_warmup
@@ -93,15 +93,15 @@ def run_kfold_training(config, comments, labels, tokenizer, device):
 
             class_weights = calculate_class_weights(train_labels)
 
-            train_dataset = data.CyberbullyingDataset(train_comments, train_labels, tokenizer, config.max_length)
-            val_dataset = data.CyberbullyingDataset(val_comments, val_labels, tokenizer, config.max_length)
+            train_dataset = data.HateSpeechDataset(train_comments, train_labels, tokenizer, config.max_length)
+            val_dataset = data.HateSpeechDataset(val_comments, val_labels, tokenizer, config.max_length)
 
             train_loader = DataLoader(train_dataset, batch_size=config.batch, shuffle=True)
             val_loader = DataLoader(val_dataset, batch_size=config.batch, shuffle=False)
 
             model = BertMultiLabelClassifier(config.model_path, len(data.LABEL_COLUMNS))
             if config.freeze_base:
-                model.freeze_base_layers(model)
+                freeze_base_layers(model)
             model.to(device)
 
             optimizer = AdamW(model.parameters(), lr=config.lr, weight_decay=0.01, eps=1e-8)

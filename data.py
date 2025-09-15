@@ -5,24 +5,25 @@ from torch.utils.data import Dataset
 import numpy as np
 import torch
 
-LABEL_COLUMNS = ['bully', 'sexual', 'religious', 'threat', 'spam']
+# Bengali hate speech dataset labels
+LABEL_COLUMNS = ['HateSpeech', 'Emotion']
 
-class CyberbullyingDataset(Dataset):
-    def __init__(self, comments, labels, tokenizer, max_length=128):
-        self.comments = comments
+class HateSpeechDataset(Dataset):
+    def __init__(self, texts, labels, tokenizer, max_length=128):
+        self.texts = texts
         self.labels = labels.astype(np.float32) if isinstance(labels, np.ndarray) else labels
         self.tokenizer = tokenizer
         self.max_length = max_length
 
     def __len__(self):
-        return len(self.comments)
+        return len(self.texts)
 
     def __getitem__(self, idx):
-        comment = str(self.comments[idx])
+        text = str(self.texts[idx])
         labels = self.labels[idx]
 
         encoding = self.tokenizer(
-            comment,
+            text,
             truncation=True,
             padding='max_length',
             max_length=self.max_length,
@@ -37,17 +38,30 @@ class CyberbullyingDataset(Dataset):
 
 def load_and_preprocess_data(dataset_path):
     df = pd.read_csv(dataset_path)
-    # Drop unnecessary columns if present
-    columns_to_drop = [col for col in ['Gender', 'Profession'] if col in df.columns]
-    df_clean = df.drop(columns_to_drop, axis=1) if columns_to_drop else df
     # Ensure label columns exist
     for col in LABEL_COLUMNS:
-        if col not in df_clean.columns:
+        if col not in df.columns:
             raise ValueError(f"Missing label column: {col}")
-    comments = df_clean['comment'].values
-    labels = df_clean[LABEL_COLUMNS].values
-    return comments, labels
+    
+    # Handle NaN values in labels - replace with most common value
+    for col in LABEL_COLUMNS:
+        most_common = df[col].mode()[0] if not df[col].empty else 'nonhate'
+        df[col] = df[col].fillna(most_common)
+    
+    # Handle NaN values in text - replace with empty string
+    df['Comments'] = df['Comments'].fillna('')
+    
+    # Convert categorical labels to numerical values
+    # HateSpeech: 'hate' -> 1, 'nonhate' -> 0
+    df['HateSpeech'] = df['HateSpeech'].map({'hate': 1, 'nonhate': 0}).fillna(0)
+    
+    # Emotion: 'sad' -> 1, 'angry' -> 0 (binary classification for simplicity)
+    df['Emotion'] = df['Emotion'].map({'sad': 1, 'angry': 0}).fillna(0)
+    
+    texts = df['Comments'].values
+    labels = df[LABEL_COLUMNS].values
+    return texts, labels
 
-def prepare_kfold_splits(comments, labels, num_folds=5):
+def prepare_kfold_splits(texts, labels, num_folds=5):
     kfold = KFold(n_splits=num_folds, shuffle=True, random_state=42)
-    return kfold.split(comments)
+    return kfold.split(texts)

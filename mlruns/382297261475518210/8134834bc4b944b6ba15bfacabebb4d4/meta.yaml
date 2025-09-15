@@ -1,0 +1,14 @@
+artifact_uri: file:///mnt/data/h0p3/experiment/Finetune-Bangla-BERT-on-Bangla-hate-speech-Data/mlruns/382297261475518210/8134834bc4b944b6ba15bfacabebb4d4/artifacts
+end_time: 1757917481831
+entry_point_name: ''
+experiment_id: '382297261475518210'
+lifecycle_stage: active
+run_id: 8134834bc4b944b6ba15bfacabebb4d4
+run_name: nabil_32_2e-05_20
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1757917432663
+status: 4
+tags: []
+user_id: magus
