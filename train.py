@@ -1,227 +1,683 @@
 # =========================
-# model.py  (fixed masks for MultiheadAttention)
+# train.py  (space-safe checkpoints, robust & debugged)
 # =========================
+
+import os
+# Silence TensorFlow/XLA noise if it gets imported indirectly by some deps
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+
+import json
+from datetime import datetime
+import random
+from typing import Tuple, Dict, Any
+
+import numpy as np
 import torch
-import torch.nn as nn
-from transformers import BertModel
+from torch.utils.data import DataLoader
+from torch.optim import AdamW
+
+from transformers import (
+    BertTokenizer,
+    get_linear_schedule_with_warmup,
+    get_cosine_schedule_with_warmup
+)
+
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score
+)
+
+from tqdm import tqdm
+import mlflow
+
+import data
+from model import (
+    BertMultiLabelClassifier,
+    EnhancedBertMultiLabelClassifier,
+    freeze_base_layers,
+    unfreeze_all_layers,
+    freeze_base_layers_enhanced
+)
 
 
 # -----------------------------
-# Utility: freezing helpers
+# Environment & Drive utilities
 # -----------------------------
-def freeze_base_layers(model: nn.Module):
-    """Freeze encoder params for the simple model."""
-    if hasattr(model, "bert"):
-        for p in model.bert.parameters():
-            p.requires_grad = False
+def in_colab() -> bool:
+    """Robust Colab detection."""
+    return (
+        ("COLAB_RELEASE_TAG" in os.environ)
+        or ("COLAB_GPU" in os.environ)
+        or os.path.exists("/content")
+    )
+
+COLAB_ENV = in_colab()
 
 
-def unfreeze_all_layers(model: nn.Module):
-    """Unfreeze everything."""
-    for p in model.parameters():
-        p.requires_grad = True
+def mount_google_drive() -> bool:
+    """Mount Google Drive in Colab, otherwise no-op."""
+    if not COLAB_ENV:
+        print("  Not running in Colab environment - skipping Google Drive mount")
+        print("   (Using local checkpoint storage)")
+        return False
+    try:
+        # If already mounted, keep going
+        if os.path.exists('/content/drive/MyDrive/'):
+            print(" Google Drive already mounted")
+            return True
+        from google.colab import drive  # safe: only on Colab
+        print(" Mounting Google Drive...")
+        drive.mount('/content/drive')
+        print(" Google Drive mounted successfully")
+        return True
+    except Exception as e:
+        print(f"  Google Drive mounting failed: {e}")
+        print("  Continuing with local checkpoint storage")
+        return False
 
 
-def freeze_base_layers_enhanced(model: nn.Module):
-    """Freeze encoder params for the enhanced model."""
-    if hasattr(model, "bert"):
-        for p in model.bert.parameters():
-            p.requires_grad = False
+# Initialize Google Drive mounting BEFORE creating checkpoint directory
+DRIVE_MOUNTED = mount_google_drive()
 
 
-# -----------------------------
-# Key padding mask normalization
-# -----------------------------
-def to_key_padding_mask(attention_mask: torch.Tensor | None) -> torch.Tensor | None:
+def create_checkpoint_directory(base_dir=None) -> str:
     """
-    Convert a HuggingFace attention_mask (1=keep, 0=pad; dtype long/int/bool/float)
-    into PyTorch MultiheadAttention key_padding_mask (True=PAD/IGNORE).
-    Returns None if input is None.
+    Create (and return) a checkpoint directory.
+    Priority:
+      1) explicit base_dir (if provided)
+      2) Google Drive path in Colab
+      3) local ./checkpoints
     """
-    if attention_mask is None:
-        return None
-
-    # Normalize to bool with True=PAD
-    if attention_mask.dtype == torch.bool:
-        # Assume HF semantics if bool: True=keep -> invert
-        return ~attention_mask
+    if base_dir is not None:
+        checkpoint_dir = base_dir
+    elif COLAB_ENV and DRIVE_MOUNTED:
+        checkpoint_dir = '/content/drive/MyDrive/banglabert_checkpoints'
     else:
-        # Works for float/long/int: True where PAD (==0)
-        return (attention_mask == 0)
+        checkpoint_dir = './checkpoints'
+
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    print(f" Checkpoint directory: {checkpoint_dir}")
+    return checkpoint_dir
 
 
 # -----------------------------
-# Simple classifier
+# Reproducibility
 # -----------------------------
-class BertMultiLabelClassifier(nn.Module):
-    """
-    Output logits shape: (N, 4) where:
-      logits[:, :1] -> Hate (binary, use BCEWithLogits)
-      logits[:, 1:] -> Emotion classes (3 classes, use CrossEntropy)
-    """
-    def __init__(
-        self,
-        model_name_or_path: str,
-        num_labels: int = 4,
-        dropout: float = 0.1,
-        multi_task: bool = True,
-        config=None
-    ):
-        super().__init__()
-        self.bert = BertModel.from_pretrained(model_name_or_path)
-        hidden = self.bert.config.hidden_size
-        self.dropout = nn.Dropout(dropout)
-        self.classifier = nn.Linear(hidden, num_labels)
-        self.multi_task = multi_task
-        self.config = config
-
-    def forward(self, input_ids, attention_mask=None, labels=None):
-        outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
-        # Use pooled output (CLS) for simplicity
-        pooled = outputs.pooler_output  # (N, H)
-        x = self.dropout(pooled)
-        logits = self.classifier(x)  # (N, 4)
-
-        out = {"logits": logits}
-
-        if labels is not None:
-            # labels: (N, 2) -> [:,0]=hate(0/1), [:,1]=emotion class id in {0,1,2}
-            hate_targets = labels[:, 0].float()
-            emo_targets = labels[:, 1].long()
-
-            hate_logits = logits[:, 0]            # (N,)
-            emo_logits = logits[:, 1:]            # (N, 3)
-
-            hate_loss = nn.functional.binary_cross_entropy_with_logits(hate_logits, hate_targets)
-            emo_loss = nn.functional.cross_entropy(emo_logits, emo_targets)
-
-            loss = hate_loss + emo_loss
-            out["loss"] = loss
-
-        return out
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # Deterministic can slow down
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
 
 
 # -----------------------------
-# Enhanced cross-attention block
+# Checkpoint helpers
 # -----------------------------
-class CrossAttentionBlock(nn.Module):
+def _best_ckpt_path(checkpoint_dir: str, fold: int) -> str:
+    """Fixed best-checkpoint filename per fold."""
+    return os.path.join(checkpoint_dir, f'best_fold_{fold}.pth')
+
+
+def _delete_old_pths_for_fold(checkpoint_dir: str, fold: int, keep_path: str | None = None):
     """
-    One-head block that queries the sequence using a learned projection of CLS (or any query).
-    Uses nn.MultiheadAttention with batch_first=True and a correct key_padding_mask.
+    Delete all .pth files for a given fold except `keep_path`.
+    Keeps JSON metadata files intact.
     """
-    def __init__(self, hidden_size: int, num_heads: int = 8, attn_dropout: float = 0.1):
-        super().__init__()
-        self.attention = nn.MultiheadAttention(
-            embed_dim=hidden_size,
-            num_heads=num_heads,
-            dropout=attn_dropout,
-            batch_first=True,      # IMPORTANT: (N, S, E)
+    if not os.path.isdir(checkpoint_dir):
+        return
+    for fname in os.listdir(checkpoint_dir):
+        if not fname.endswith('.pth'):
+            continue
+        # Match both old pattern and new best_ pattern
+        if fname.startswith(f'checkpoint_fold_{fold}_epoch_') or fname == f'best_fold_{fold}.pth':
+            full = os.path.join(checkpoint_dir, fname)
+            if keep_path is not None and os.path.abspath(full) == os.path.abspath(keep_path):
+                continue
+            try:
+                os.remove(full)
+            except Exception as e:
+                print(f"  Warning: could not delete {full}: {e}")
+
+
+def save_checkpoint(epoch, model, optimizer, scheduler, fold, val_f1, train_loss, val_metrics, config_obj, checkpoint_dir):
+    """
+    Save only the latest/best .pth for this fold (overwriting/deleting older .pth files),
+    but ALWAYS append a JSON metadata file per improved epoch to keep history.
+    """
+    checkpoint = {
+        'epoch': int(epoch),
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'fold': int(fold),
+        'val_f1': float(val_f1),
+        'train_loss': float(train_loss),
+        'config': config_obj.__dict__ if hasattr(config_obj, '__dict__') else config_obj,
+        'timestamp': str(np.datetime64('now'))
+    }
+
+    # Fixed best path per fold
+    best_path = _best_ckpt_path(checkpoint_dir, fold)
+
+    # First, delete any previous .pth files for this fold (will also remove old best if present)
+    _delete_old_pths_for_fold(checkpoint_dir, fold, keep_path=None)
+
+    # Now save the new best
+    torch.save(checkpoint, best_path)
+    print(f" Checkpoint saved (best for fold {fold}): {best_path}")
+
+    # Also save a metadata JSON for this improved epoch (do NOT delete old JSONs)
+    metadata = {
+        'fold': int(fold),
+        'epoch': int(epoch),
+        'val_f1': float(val_f1),
+        'hate_f1': float(val_metrics.get('hate_f1', 0.0)),
+        'emotion_f1': float(val_metrics.get('emotion_f1', 0.0)),
+        'hate_accuracy': float(val_metrics.get('hate_accuracy', 0.0)),
+        'hate_precision': float(val_metrics.get('hate_precision', 0.0)),
+        'hate_recall': float(val_metrics.get('hate_recall', 0.0)),
+        'emotion_accuracy': float(val_metrics.get('emotion_accuracy', 0.0)),
+        'emotion_precision': float(val_metrics.get('emotion_precision', 0.0)),
+        'emotion_recall': float(val_metrics.get('emotion_recall', 0.0)),
+        'overall_accuracy': float(val_metrics.get('overall_accuracy', 0.0)),
+        'train_loss': float(train_loss),
+        'checkpoint_path': best_path,  # current best
+        'timestamp': checkpoint['timestamp']
+    }
+    metadata_path = os.path.join(checkpoint_dir, f'metadata_fold_{fold}_epoch_{epoch}.json')
+    try:
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata, f, indent=2)
+    except Exception as e:
+        print(f"  Warning: could not write metadata JSON {metadata_path}: {e}")
+
+    return best_path
+
+
+def load_checkpoint(checkpoint_path, model, optimizer, scheduler, device) -> Dict[str, Any]:
+    """Load training checkpoint and return state."""
+    print(f" Loading checkpoint: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+
+    return {
+        'epoch': checkpoint['epoch'],
+        'fold': checkpoint['fold'],
+        'val_f1': checkpoint['val_f1'],
+        'train_loss': checkpoint['train_loss'],
+        'config': checkpoint.get('config', None)
+    }
+
+
+def _find_latest_legacy_checkpoint(checkpoint_dir: str, fold: int):
+    """Back-compat: if old per-epoch files exist, pick the highest epoch."""
+    pattern = f'checkpoint_fold_{fold}_epoch_'
+    best = None
+    if os.path.exists(checkpoint_dir):
+        for file in os.listdir(checkpoint_dir):
+            if file.startswith(pattern) and file.endswith('.pth'):
+                try:
+                    epoch = int(file.split('_')[-1].split('.')[0])
+                    path = os.path.join(checkpoint_dir, file)
+                    if (best is None) or (epoch > best[0]):
+                        best = (epoch, path)
+                except ValueError:
+                    continue
+    return best  # (epoch, path) or None
+
+
+def find_latest_checkpoint(checkpoint_dir, fold):
+    """
+    Find the resume checkpoint for a fold.
+    Preference:
+      1) New scheme: best_fold_{fold}.pth
+      2) Legacy scheme: highest epoch checkpoint_fold_{fold}_epoch_*.pth
+    Returns (epoch, path) or (None, None)
+    """
+    best_path = _best_ckpt_path(checkpoint_dir, fold)
+    if os.path.exists(best_path):
+        # Read epoch from file contents for accuracy
+        try:
+            ckpt = torch.load(best_path, map_location='cpu')
+            return int(ckpt.get('epoch', 0)), best_path
+        except Exception:
+            # Fallback: unknown epoch, still resume from best
+            return None, best_path
+
+    legacy = _find_latest_legacy_checkpoint(checkpoint_dir, fold)
+    if legacy is not None:
+        return legacy[0], legacy[1]
+    return None, None
+
+
+def should_resume_from_checkpoint(checkpoint_dir, fold, config_obj):
+    """Decide whether to resume from an existing checkpoint."""
+    latest_epoch, checkpoint_path = find_latest_checkpoint(checkpoint_dir, fold)
+
+    if checkpoint_path and (latest_epoch is None or latest_epoch < config_obj.num_epochs):
+        ep_info = "unknown" if latest_epoch is None else latest_epoch
+        print(f" Found checkpoint for fold {fold}, epoch {ep_info}")
+        print(f"   Resuming from epoch {(0 if latest_epoch is None else latest_epoch + 1)}")
+        return True, checkpoint_path, latest_epoch
+    elif checkpoint_path and latest_epoch is not None and latest_epoch >= config_obj.num_epochs:
+        print(f" Fold {fold} already completed (epoch {latest_epoch})")
+        return False, checkpoint_path, latest_epoch
+    else:
+        print(f" No checkpoint found for fold {fold}, starting fresh")
+        return False, None, None
+
+
+# -----------------------------
+# Metrics & weighting
+# -----------------------------
+def calculate_class_weights(labels):
+    """Calculate balanced class weights; safe for missing classes."""
+    # For HateSpeech (binary: column 0 is 0/1)
+    hate_true = labels[:, 0]
+    hate_pos = np.sum(hate_true)
+    hate_neg = len(labels) - hate_pos
+    hate_weight = (hate_neg / max(hate_pos, 1)) if hate_pos > 0 else 1.0
+
+    # For Emotion (multi-class: column 1 has class ids)
+    emotion_true = labels[:, 1].astype(int)
+    emotion_counts = np.bincount(emotion_true)
+    safe_counts = np.where(emotion_counts == 0, 1, emotion_counts)
+    emotion_weights = len(labels) / (len(safe_counts) * safe_counts)
+
+    return {
+        'hate_weight': torch.FloatTensor([hate_weight]),
+        'emotion_weights': torch.FloatTensor(emotion_weights)
+    }
+
+
+def calculate_metrics(y_true, y_pred):
+    """Calculate comprehensive metrics for binary (hate) + multiclass (emotion)."""
+    # HateSpeech metrics (binary)
+    hate_true = y_true[:, 0]
+    hate_pred = (y_pred[:, 0] > 0.5).astype(int)
+
+    hate_accuracy = accuracy_score(hate_true, hate_pred)
+    hate_precision = precision_score(hate_true, hate_pred, average='binary', zero_division=0)
+    hate_recall = recall_score(hate_true, hate_pred, average='binary', zero_division=0)
+    hate_f1 = f1_score(hate_true, hate_pred, average='binary', zero_division=0)
+
+    # Emotion metrics (multi-class)
+    emotion_true = y_true[:, 1].astype(int)
+    emotion_pred = np.argmax(y_pred[:, 1:], axis=1)
+
+    emotion_accuracy = accuracy_score(emotion_true, emotion_pred)
+    emotion_precision = precision_score(emotion_true, emotion_pred, average='macro', zero_division=0)
+    emotion_recall = recall_score(emotion_true, emotion_pred, average='macro', zero_division=0)
+    emotion_f1 = f1_score(emotion_true, emotion_pred, average='macro', zero_division=0)
+
+    # Overall metrics
+    overall_accuracy = (hate_accuracy + emotion_accuracy) / 2.0
+    overall_f1 = (hate_f1 + emotion_f1) / 2.0
+
+    return {
+        'hate_accuracy': hate_accuracy,
+        'hate_precision': hate_precision,
+        'hate_recall': hate_recall,
+        'hate_f1': hate_f1,
+        'emotion_accuracy': emotion_accuracy,
+        'emotion_precision': emotion_precision,
+        'emotion_recall': emotion_recall,
+        'emotion_f1': emotion_f1,
+        'overall_accuracy': overall_accuracy,
+        'overall_f1': overall_f1
+    }
+
+
+# -----------------------------
+# Sanity checks
+# -----------------------------
+def _assert_batch_ok(batch: Dict[str, torch.Tensor], num_emotion_classes: int = 3):
+    # input_ids / attention_mask
+    assert 'input_ids' in batch and 'attention_mask' in batch and 'labels' in batch, \
+        "Batch must have input_ids, attention_mask, labels keys."
+
+    B = batch['input_ids'].shape[0]
+    assert batch['attention_mask'].shape[0] == B, "attention_mask batch size mismatch."
+    assert batch['labels'].shape[0] == B, "labels batch size mismatch."
+
+    # labels shape: (N, 2): hate(0/1), emotion_class {0..C-1}
+    assert batch['labels'].ndim == 2 and batch['labels'].shape[1] == 2, \
+        f"labels must be shape (N,2). Got {tuple(batch['labels'].shape)}"
+
+    # value ranges
+    hate_vals = batch['labels'][:, 0]
+    emo_vals = batch['labels'][:, 1]
+    if torch.is_floating_point(hate_vals):
+        # allow float; later converted to float in loss anyway
+        pass
+    else:
+        assert ((hate_vals == 0) | (hate_vals == 1)).all(), "Hate labels must be 0/1."
+    assert ((emo_vals >= 0) & (emo_vals < num_emotion_classes)).all(), \
+        f"Emotion labels must be in [0,{num_emotion_classes-1}]."
+
+
+# -----------------------------
+# Train / Eval loops
+# -----------------------------
+def train_epoch(model, dataloader, optimizer, scheduler, device, class_weights=None, use_amp: bool = False):
+    model.train()
+    total_loss = 0.0
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
+    for batch in tqdm(dataloader, desc='Training'):
+        _assert_batch_ok(batch)
+        input_ids = batch['input_ids'].to(device, non_blocking=True)
+        attention_mask = batch['attention_mask'].to(device, non_blocking=True)
+        labels = batch['labels'].to(device, non_blocking=True)
+
+        optimizer.zero_grad(set_to_none=True)
+
+        with torch.cuda.amp.autocast(enabled=use_amp):
+            outputs = model(input_ids, attention_mask=attention_mask, labels=labels)
+            loss = outputs['loss']
+
+        scaler.scale(loss).backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        scaler.step(optimizer)
+        scaler.update()
+
+        scheduler.step()
+
+        total_loss += float(loss.item())
+
+    return total_loss / max(len(dataloader), 1)
+
+
+def evaluate_model(model, dataloader, device, use_amp: bool = False):
+    model.eval()
+    total_loss = 0.0
+    all_predictions = []
+    all_labels = []
+
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc='Evaluating'):
+            _assert_batch_ok(batch)
+            input_ids = batch['input_ids'].to(device, non_blocking=True)
+            attention_mask = batch['attention_mask'].to(device, non_blocking=True)
+            labels = batch['labels'].to(device, non_blocking=True)
+
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                outputs = model(input_ids, attention_mask=attention_mask, labels=labels)
+                loss = outputs['loss']
+
+            total_loss += float(loss.item())
+
+            # Apply sigmoid to HateSpeech logits and softmax to Emotion logits
+            predictions = outputs['logits']
+            hate_pred = torch.sigmoid(predictions[:, :1])
+            emotion_pred = torch.softmax(predictions[:, 1:], dim=1)
+
+            # Combine predictions
+            combined_pred = torch.cat([hate_pred, emotion_pred], dim=1)
+            all_predictions.extend(combined_pred.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+
+    avg_loss = total_loss / max(len(dataloader), 1)
+    metrics = calculate_metrics(np.array(all_labels), np.array(all_predictions))
+    metrics['loss'] = avg_loss
+    return metrics
+
+
+# -----------------------------
+# Utilities
+# -----------------------------
+def _ensure_numpy(arr_like):
+    # Make sure indexing with k-fold splits works
+    if isinstance(arr_like, np.ndarray):
+        return arr_like
+    return np.array(arr_like)
+
+
+def _build_model_from_config(config_obj):
+    if getattr(config_obj, "use_enhanced_model", False):
+        model = EnhancedBertMultiLabelClassifier(
+            config_obj.model_path,
+            4,  # 1 for HateSpeech + 3 for Emotion classes
+            dropout=config_obj.dropout,
+            multi_task=True,
+            config=config_obj
         )
-        self.norm = nn.LayerNorm(hidden_size)
-        self.ff = nn.Sequential(
-            nn.Linear(hidden_size, 4 * hidden_size),
-            nn.GELU(),
-            nn.Dropout(attn_dropout),
-            nn.Linear(4 * hidden_size, hidden_size),
+        if config_obj.freeze_base:
+            freeze_base_layers_enhanced(model)
+    else:
+        model = BertMultiLabelClassifier(
+            config_obj.model_path,
+            4,  # 1 for HateSpeech + 3 for Emotion classes
+            dropout=config_obj.dropout,
+            multi_task=True,
+            config=config_obj
         )
-        self.ff_norm = nn.LayerNorm(hidden_size)
-
-    def forward(self, query: torch.Tensor, key_value: torch.Tensor, attention_mask: torch.Tensor | None):
-        """
-        query:      (N, 1, E)
-        key_value:  (N, S, E)
-        attention_mask (HF style): (N, S) where 1=keep, 0=pad
-        """
-        key_padding_mask = to_key_padding_mask(attention_mask)  # (N, S), True=PAD
-
-        attn_output, _ = self.attention(
-            query=query,
-            key=key_value,
-            value=key_value,
-            key_padding_mask=key_padding_mask
-        )  # (N, 1, E)
-
-        # Residual + norm on the query path
-        x = self.norm(query + attn_output)
-        y = self.ff_norm(x + self.ff(x))
-        return y  # (N, 1, E)
+        if config_obj.freeze_base:
+            freeze_base_layers(model)
+    return model
 
 
 # -----------------------------
-# Enhanced classifier with cross-attention heads
+# K-fold training orchestration
 # -----------------------------
-class EnhancedBertMultiLabelClassifier(nn.Module):
-    """
-    Uses BERT to encode tokens, then runs two small cross-attention heads that
-    each attend from a CLS-query to the full sequence, and fuses them.
-    """
-    def __init__(
-        self,
-        model_name_or_path: str,
-        num_labels: int = 4,
-        dropout: float = 0.1,
-        multi_task: bool = True,
-        config=None
-    ):
-        super().__init__()
-        self.bert = BertModel.from_pretrained(model_name_or_path)
-        hidden = self.bert.config.hidden_size
-        self.multi_task = multi_task
-        self.config = config
+def run_kfold_training(config_obj, comments, labels, tokenizer, device):
+    set_seed(getattr(config_obj, "seed", 42))
+    use_amp = bool(getattr(config_obj, "use_amp", False))
+    mlflow.set_experiment(config_obj.mlflow_experiment_name)
 
-        num_heads = getattr(config, "num_attention_heads", 8)
-        attn_dropout = getattr(config, "attn_dropout", dropout)
+    checkpoint_dir = create_checkpoint_directory(getattr(config_obj, "checkpoint_dir", None))
 
-        print(f"Using enhanced model architecture with {num_heads} attention heads")
+    # Enforce ndarray for k-fold indexing
+    comments = _ensure_numpy(comments)
+    labels = _ensure_numpy(labels)
 
-        # Two parallel cross-attention blocks (can be extended)
-        self.hate_cross_attention = CrossAttentionBlock(hidden, num_heads=num_heads, attn_dropout=attn_dropout)
-        self.emotion_cross_attention = CrossAttentionBlock(hidden, num_heads=num_heads, attn_dropout=attn_dropout)
+    # Quick global sanity check for labels
+    assert labels.ndim == 2 and labels.shape[1] == 2, \
+        f"labels must have shape (N,2) [hate, emotion]. Got {labels.shape}"
 
-        # Projection from CLS to queries
-        self.query_proj_hate = nn.Linear(hidden, hidden)
-        self.query_proj_emotion = nn.Linear(hidden, hidden)
+    run_name = f"{config_obj.author_name}_{config_obj.batch_size}_{config_obj.learning_rate}_{config_obj.num_epochs}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    with mlflow.start_run(run_name=run_name):
+        # Log parameters
+        mlflow.log_params({
+            'batch_size': config_obj.batch_size,
+            'learning_rate': config_obj.learning_rate,
+            'num_epochs': config_obj.num_epochs,
+            'num_folds': config_obj.num_folds,
+            'max_length': config_obj.max_length,
+            'freeze_base': config_obj.freeze_base,
+            'dropout': config_obj.dropout,
+            'author_name': config_obj.author_name,
+            'model_path': config_obj.model_path,
+            'scheduler_type': getattr(config_obj, "scheduler_type", "linear"),
+            'warmup_steps': getattr(config_obj, "warmup_steps", 0),
+            'use_enhanced_model': getattr(config_obj, "use_enhanced_model", False),
+            'num_attention_heads': getattr(config_obj, "num_attention_heads", 8),
+            'attn_dropout': getattr(config_obj, "attn_dropout", config_obj.dropout),
+            'use_amp': use_amp,
+            'seed': getattr(config_obj, "seed", 42),
+        })
 
-        self.dropout = nn.Dropout(dropout)
+        kfold_splits = data.prepare_kfold_splits(comments, labels, config_obj.num_folds)
+        fold_results = []
 
-        # Heads
-        self.hate_head = nn.Linear(hidden, 1)   # binary logit
-        self.emo_head = nn.Linear(hidden, 3)    # 3-way emotion
+        for fold, (train_idx, val_idx) in enumerate(kfold_splits):
+            print(f"Fold {fold + 1}/{config_obj.num_folds}")
+            train_comments, val_comments = comments[train_idx], comments[val_idx]
+            train_labels, val_labels = labels[train_idx], labels[val_idx]
 
-    def forward(self, input_ids, attention_mask=None, labels=None):
-        enc = self.bert(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
-        seq = enc.last_hidden_state            # (N, S, H)
-        cls = enc.pooler_output                # (N, H)  (tanh(W h_cls))
-        # Use CLS as the seed query, project, and add a sequence length dim=1
-        q_hate = self.query_proj_hate(cls).unsqueeze(1)     # (N, 1, H)
-        q_emo  = self.query_proj_emotion(cls).unsqueeze(1)  # (N, 1, H)
+            # Defensive: shapes & ranges
+            assert train_labels.ndim == 2 and train_labels.shape[1] == 2, "Train labels shape must be (N,2)."
+            assert val_labels.ndim == 2 and val_labels.shape[1] == 2, "Val labels shape must be (N,2)."
 
-        # Cross-attend over the token sequence
-        hate_ctx = self.hate_cross_attention(q_hate, seq, attention_mask).squeeze(1)  # (N, H)
-        emo_ctx  = self.emotion_cross_attention(q_emo, seq, attention_mask).squeeze(1)  # (N, H)
+            class_weights = calculate_class_weights(train_labels)  # currently not injected into loss; keep for future
 
-        hate_ctx = self.dropout(hate_ctx)
-        emo_ctx  = self.dropout(emo_ctx)
+            train_dataset = data.HateSpeechDataset(
+                train_comments, train_labels, tokenizer,
+                config_obj.max_length, augment=True
+            )
+            val_dataset = data.HateSpeechDataset(
+                val_comments, val_labels, tokenizer,
+                config_obj.max_length, augment=False
+            )
 
-        hate_logit = self.hate_head(hate_ctx)     # (N, 1)
-        emo_logits = self.emo_head(emo_ctx)       # (N, 3)
+            # NOTE: pin_memory helps for CUDA; drop_last avoids last tiny batch (optional)
+            train_loader = DataLoader(
+                train_dataset,
+                batch_size=config_obj.batch_size,
+                shuffle=True,
+                num_workers=getattr(config_obj, "num_workers", 2),
+                pin_memory=torch.cuda.is_available(),
+                drop_last=False,
+            )
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=config_obj.batch_size,
+                shuffle=False,
+                num_workers=getattr(config_obj, "num_workers", 2),
+                pin_memory=torch.cuda.is_available(),
+                drop_last=False,
+            )
 
-        logits = torch.cat([hate_logit, emo_logits], dim=1)  # (N, 4)
-        out = {"logits": logits}
+            model = _build_model_from_config(config_obj)
+            model.to(device)
 
-        if labels is not None:
-            # labels: (N, 2) -> [:,0]=hate(0/1), [:,1]=emotion class id in {0,1,2}
-            hate_targets = labels[:, 0].float()
-            emo_targets = labels[:, 1].long()
+            optimizer = AdamW(
+                model.parameters(),
+                lr=config_obj.learning_rate,
+                weight_decay=0.01,
+                eps=1e-8
+            )
 
-            hate_loss = nn.functional.binary_cross_entropy_with_logits(hate_logit.squeeze(1), hate_targets)
-            emo_loss = nn.functional.cross_entropy(emo_logits, emo_targets)
+            total_steps = max(len(train_loader) * config_obj.num_epochs, 1)
 
-            # Optional weighting knobs (not required; defaults are 1.0)
-            hate_w = float(getattr(self.config, "loss_weight_hate", 1.0)) if self.config is not None else 1.0
-            emo_w  = float(getattr(self.config, "loss_weight_emotion", 1.0)) if self.config is not None else 1.0
+            # Dynamic scheduler selection based on config
+            if getattr(config_obj, "scheduler_type", "linear") == "cosine":
+                scheduler = get_cosine_schedule_with_warmup(
+                    optimizer,
+                    num_warmup_steps=int(0.1 * total_steps),
+                    num_training_steps=total_steps
+                )
+            else:
+                scheduler = get_linear_schedule_with_warmup(
+                    optimizer,
+                    num_warmup_steps=getattr(config_obj, "warmup_steps", 0),
+                    num_training_steps=total_steps
+                )
 
-            loss = hate_w * hate_loss + emo_w * emo_loss
-            out["loss"] = loss
+            resume_from_checkpoint, checkpoint_path, latest_epoch = should_resume_from_checkpoint(checkpoint_dir, fold, config_obj)
 
-        return out
+            # Safe resume: if state-dict mismatch, skip resume
+            if resume_from_checkpoint:
+                try:
+                    checkpoint_state = load_checkpoint(checkpoint_path, model, optimizer, scheduler, device)
+                    start_epoch = int(checkpoint_state['epoch']) + 1
+                    best_f1 = float(checkpoint_state['val_f1'])
+                    best_metrics = None
+                except Exception as e:
+                    print(f"  Resume failed due to mismatch or corruption: {e}")
+                    print("  Starting fresh for this fold.")
+                    start_epoch = 0
+                    best_f1 = -1.0
+                    best_metrics = None
+            else:
+                start_epoch = 0
+                best_f1 = -1.0  # ensure the first improvement is captured
+                best_metrics = None
+
+            patience = getattr(config_obj, "early_stopping_patience", 3)
+            patience_counter = 0
+
+            for epoch in range(start_epoch, config_obj.num_epochs):
+                train_loss = train_epoch(model, train_loader, optimizer, scheduler, device, class_weights, use_amp)
+                val_metrics = evaluate_model(model, val_loader, device, use_amp)
+
+                print(f"Epoch {epoch+1}: Train Loss={train_loss:.4f}, Val F1={val_metrics['overall_f1']:.4f}")
+                print(f"  Hate F1: {val_metrics['hate_f1']:.4f}, Emotion F1: {val_metrics['emotion_f1']:.4f}")
+
+                if val_metrics['overall_f1'] > best_f1:
+                    best_f1 = float(val_metrics['overall_f1'])
+                    best_metrics = val_metrics.copy()
+                    patience_counter = 0
+                    save_checkpoint(epoch, model, optimizer, scheduler, fold, best_f1, train_loss, val_metrics, config_obj, checkpoint_dir)
+                else:
+                    patience_counter += 1
+
+                # Log epoch metrics to MLflow
+                mlflow.log_metrics({
+                    f"fold_{fold}_epoch_{epoch}_train_loss": float(train_loss),
+                    f"fold_{fold}_epoch_{epoch}_val_loss": float(val_metrics['loss']),
+                    f"fold_{fold}_epoch_{epoch}_overall_f1": float(val_metrics['overall_f1']),
+                    f"fold_{fold}_epoch_{epoch}_hate_f1": float(val_metrics['hate_f1']),
+                    f"fold_{fold}_epoch_{epoch}_emotion_f1": float(val_metrics['emotion_f1'])
+                })
+
+                if patience_counter >= patience:
+                    print(f"Early stopping at epoch {epoch+1}")
+                    break
+
+            # Safety: if no improvement happened, fall back to last val_metrics
+            if best_metrics is None:
+                best_metrics = val_metrics
+
+            fold_results.append(best_metrics)
+            print(f"Fold {fold+1} Best - Overall F1: {best_metrics['overall_f1']:.4f}")
+
+            # Log best fold metrics
+            mlflow.log_metrics({
+                f"fold_{fold}_best_overall_f1": float(best_metrics['overall_f1']),
+                f"fold_{fold}_best_hate_f1": float(best_metrics['hate_f1']),
+                f"fold_{fold}_best_emotion_f1": float(best_metrics['emotion_f1'])
+            })
+
+        # Calculate and log average metrics
+        avg_metrics = {}
+        if not fold_results:
+            raise RuntimeError("No fold results collected. Check your data splits.")
+        keys_to_avg = [k for k in fold_results[0].keys() if k != 'loss']
+        for key in keys_to_avg:
+            avg_metrics[f"avg_{key}"] = float(np.mean([result[key] for result in fold_results]))
+
+        print(f"\nAverage Results across {config_obj.num_folds} folds:")
+        print(f"Overall F1: {avg_metrics['avg_overall_f1']:.4f}")
+        print(f"Hate F1: {avg_metrics['avg_hate_f1']:.4f}")
+        print(f"Emotion F1: {avg_metrics['avg_emotion_f1']:.4f}")
+
+        mlflow.log_metrics(avg_metrics)
+
+        # Log final model artifact (last fold's model state)
+        # If model was moved to CUDA, mlflow will handle it.
+        mlflow.pytorch.log_model(model, "model")
+
+
+# -----------------------------
+# Main entry
+# -----------------------------
+if __name__ == "__main__":
+    import config as cfg_mod
+
+    # Load configuration
+    config = cfg_mod.parse_arguments()
+
+    # Set device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+
+    # Seed
+    set_seed(getattr(config, "seed", 42))
+
+    # Load tokenizer
+    tokenizer = BertTokenizer.from_pretrained(config.model_path)
+
+    # Load and preprocess data
+    comments, labels = data.load_and_preprocess_data(config.dataset_path)
+
+    # Run training
+    run_kfold_training(config, comments, labels, tokenizer, device)
