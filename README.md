@@ -1,10 +1,10 @@
-# BanglaBERT Cyberbullying Detection Fine-Tuning
+# BanglaBERT Hate Speech Detection Fine-Tuning
 
 ![BanglaBERT Logo](https://img.shields.io/badge/Model-BanglaBERT-blue) ![License](https://img.shields.io/badge/License-MIT-green) ![Python](https://img.shields.io/badge/Python-3.8%2B-yellow)
 
 ## Project Overview
 
-This project provides a modular Python framework for fine-tuning the BanglaBERT model (from `sagorsarker/bangla-bert-base`) on a Bangla cyberbullying dataset for multi-label classification. The dataset consists of comments labeled with five binary categories: `bully`, `sexual`, `religious`, `threat`, and `spam`.
+This project provides a modular Python framework for fine-tuning the BanglaBERT model (from `sagorsarker/bangla-bert-base`) on a Bangla hate speech dataset for multi-label classification. The dataset consists of comments labeled with two main categories: `HateSpeech` (hate/nonhate) and `Emotion` (sad/angry/happy).
 
 The framework uses PyTorch for training, Hugging Face Transformers for model handling, and MLflow for experiment tracking. It supports K-Fold cross-validation (default: 5 folds), class weighting for imbalanced labels, early stopping, and optional freezing of base layers during fine-tuning.
 
@@ -23,8 +23,8 @@ Run fine-tuning via `main.py` with command-line arguments. All experiments log t
 ### Running in Google Colab (Recommended for Free GPU)
 1. Open Colab: [colab.research.google.com](https://colab.research.google.com).
 2. Enable GPU: Runtime > Change runtime type > T4 GPU.
-3. Clone repo: `!git clone https://github.com/SaifSiddique009/Finetune-Bangla-BERT-on-Bangla-Cyber-Bullying-Data.git`
-4. `%cd Finetun-Bangla-BERT-on-Bangla-Cyber-Bullying-Data`
+3. Clone repo: `!git clone https://github.com/AnnNaserNabil/Finetune-Bangla-BERT-on-Bangla-HATE-Speech-Data.git`
+4. `%cd Finetune-Bangla-BERT-on-Bangla-HATE-Speech-Data`
 5. Install deps: `!pip install -r requirements.txt`
 6. Pick an experiment from `experiments.py` (open the file, copy a dict's values).
 7. Run command (replace with your values):
@@ -41,7 +41,7 @@ Run fine-tuning via `main.py` with command-line arguments. All experiments log t
      - `--num_folds`: Folds for CV (default: 5).
      - `--max_length`: Token max length (default: 128).
      - `--freeze_base`: Freeze BERT base layers.
-     - `--mlflow_experiment_name`: Experiment name (default: 'Bangla-BERT-Cyberbullying').
+     - `--mlflow_experiment_name`: Experiment name (default: 'Bangla-BERT-Hate-Speech').
 
 8. After run: Zip and download MLflow logs:
    ```
