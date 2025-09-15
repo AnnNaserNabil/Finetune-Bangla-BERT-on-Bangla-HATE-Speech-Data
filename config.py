@@ -10,6 +10,7 @@ class ExperimentConfig:
     # Model parameters
     model_name: str = "sagorsarker/bangla-bert-base"
     model_path: str = "sagorsarker/bangla-bert-base"
+    use_enhanced_model: bool = True  # Enable enhanced model architecture
     
     # Training parameters - ENHANCED for 93% F1
     batch_size: int = 32          # Enhanced: Increased from 16 to 32 for better gradient estimation
@@ -27,6 +28,14 @@ class ExperimentConfig:
     # Model architecture
     freeze_base: bool = True
     multi_task: bool = True
+    
+    # Enhanced model architecture parameters
+    attention_heads: int = 8       # Number of attention heads for multi-head attention
+    cross_attention_heads: int = 4 # Number of attention heads for cross-attention
+    stochastic_depth: float = 0.1  # Stochastic depth probability for regularization
+    use_gelu_activation: bool = True  # Use GELU activation instead of ReLU
+    use_layer_wise_lr: bool = False  # Enable layer-wise learning rate decay
+    layer_wise_decay: float = 0.9   # Layer-wise learning rate decay factor
     
     # Data parameters
     dataset_path: str = "data/5_BanEmoHate.csv"
@@ -80,6 +89,12 @@ class ExperimentConfig:
             print(f"Warning: Loss weights sum to {total_weight}, normalizing to 1.0")
             self.hate_speech_loss_weight /= total_weight
             self.emotion_loss_weight /= total_weight
+        
+        # Validate enhanced model parameters
+        if self.use_enhanced_model:
+            print(f"Using enhanced model architecture with {self.attention_heads} attention heads")
+            if self.stochastic_depth > 0:
+                print(f"Enabled stochastic depth with probability {self.stochastic_depth}")
     
     @classmethod
     def from_dict(cls, config_dict: dict):

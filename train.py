@@ -31,7 +31,7 @@ from tqdm import tqdm
 import mlflow
 
 import data
-from model import BertMultiLabelClassifier, freeze_base_layers, unfreeze_all_layers
+from model import BertMultiLabelClassifier, EnhancedBertMultiLabelClassifier, freeze_base_layers, unfreeze_all_layers, freeze_base_layers_enhanced
 
 
 # -----------------------------
@@ -414,16 +414,26 @@ def run_kfold_training(config_obj, comments, labels, tokenizer, device):
             train_loader = DataLoader(train_dataset, batch_size=config_obj.batch_size, shuffle=True)
             val_loader = DataLoader(val_dataset, batch_size=config_obj.batch_size, shuffle=False)
 
-            model = BertMultiLabelClassifier(
-                config_obj.model_path,
-                4,  # 1 for HateSpeech + 3 for Emotion classes
-                dropout=config_obj.dropout,
-                multi_task=True,
-                config=config_obj
-            )
-
-            if config_obj.freeze_base:
-                freeze_base_layers(model)
+            if getattr(config_obj, "use_enhanced_model", False):
+                model = EnhancedBertMultiLabelClassifier(
+                    config_obj.model_path,
+                    4,  # 1 for HateSpeech + 3 for Emotion classes
+                    dropout=config_obj.dropout,
+                    multi_task=True,
+                    config=config_obj
+                )
+                if config_obj.freeze_base:
+                    freeze_base_layers_enhanced(model)
+            else:
+                model = BertMultiLabelClassifier(
+                    config_obj.model_path,
+                    4,  # 1 for HateSpeech + 3 for Emotion classes
+                    dropout=config_obj.dropout,
+                    multi_task=True,
+                    config=config_obj
+                )
+                if config_obj.freeze_base:
+                    freeze_base_layers(model)
 
             model.to(device)
 
