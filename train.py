@@ -160,7 +160,7 @@ def run_kfold_training(config, comments, labels, tokenizer, device):
 
             model = BertMultiLabelClassifier(
                 config.model_path, 
-                len(data.LABEL_COLUMNS), 
+                4,  # 1 for HateSpeech + 3 for Emotion classes
                 dropout=config.dropout,
                 multi_task=True,
                 config=config
