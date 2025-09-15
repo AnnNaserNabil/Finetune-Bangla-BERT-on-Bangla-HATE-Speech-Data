@@ -123,7 +123,7 @@ def _delete_old_pths_for_fold(checkpoint_dir: str, fold: int, keep_path: str | N
                 print(f"  Warning: could not delete {full}: {e}")
 
 
-def save_checkpoint(epoch, model, optimizer, scheduler, fold, val_f1, train_loss, config_obj, checkpoint_dir):
+def save_checkpoint(epoch, model, optimizer, scheduler, fold, val_f1, train_loss, val_metrics, config_obj, checkpoint_dir):
     """
     Save only the latest/best .pth for this fold (overwriting/deleting older .pth files),
     but ALWAYS append a JSON metadata file per improved epoch to keep history.
@@ -155,6 +155,15 @@ def save_checkpoint(epoch, model, optimizer, scheduler, fold, val_f1, train_loss
         'fold': int(fold),
         'epoch': int(epoch),
         'val_f1': float(val_f1),
+        'hate_f1': float(val_metrics.get('hate_f1', 0.0)),
+        'emotion_f1': float(val_metrics.get('emotion_f1', 0.0)),
+        'hate_accuracy': float(val_metrics.get('hate_accuracy', 0.0)),
+        'hate_precision': float(val_metrics.get('hate_precision', 0.0)),
+        'hate_recall': float(val_metrics.get('hate_recall', 0.0)),
+        'emotion_accuracy': float(val_metrics.get('emotion_accuracy', 0.0)),
+        'emotion_precision': float(val_metrics.get('emotion_precision', 0.0)),
+        'emotion_recall': float(val_metrics.get('emotion_recall', 0.0)),
+        'overall_accuracy': float(val_metrics.get('overall_accuracy', 0.0)),
         'train_loss': float(train_loss),
         'checkpoint_path': best_path,  # current best
         'timestamp': checkpoint['timestamp']
@@ -486,7 +495,7 @@ def run_kfold_training(config_obj, comments, labels, tokenizer, device):
                     best_f1 = float(val_metrics['overall_f1'])
                     best_metrics = val_metrics.copy()
                     patience_counter = 0
-                    save_checkpoint(epoch, model, optimizer, scheduler, fold, best_f1, train_loss, config_obj, checkpoint_dir)
+                    save_checkpoint(epoch, model, optimizer, scheduler, fold, best_f1, train_loss, val_metrics, config_obj, checkpoint_dir)
                 else:
                     patience_counter += 1
 
