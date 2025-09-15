@@ -3,11 +3,31 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import BertModel, BertConfig
 
+# -----------------------------
+# Mask helper (HF -> MHA)
+# -----------------------------
+def to_key_padding_mask(attention_mask: torch.Tensor | None) -> torch.Tensor | None:
+    """
+    Convert HuggingFace attention_mask (1=keep, 0=pad; any dtype)
+    to PyTorch MultiheadAttention key_padding_mask (True = PAD/IGNORE).
+    """
+    if attention_mask is None:
+        return None
+    if attention_mask.dtype == torch.bool:
+        # If someone already casted to bool keep-mask (True=keep), invert:
+        # we need True=PAD for key_padding_mask.
+        return ~attention_mask
+    # Works for int/long/float: True where PAD
+    return (attention_mask == 0)
+
+
 class MultiHeadAttentionPooling(nn.Module):
     """Multi-head attention pooling for better sequence representation"""
     def __init__(self, hidden_size, num_heads=8, dropout=0.1):
         super().__init__()
-        self.attention = nn.MultiheadAttention(hidden_size, num_heads, dropout=dropout, batch_first=True)
+        self.attention = nn.MultiheadAttention(
+            hidden_size, num_heads, dropout=dropout, batch_first=True
+        )
         self.query = nn.Linear(hidden_size, hidden_size)
         self.key = nn.Linear(hidden_size, hidden_size)
         self.value = nn.Linear(hidden_size, hidden_size)
@@ -15,51 +35,75 @@ class MultiHeadAttentionPooling(nn.Module):
         self.dropout = nn.Dropout(dropout)
         
     def forward(self, hidden_states, attention_mask):
+        """
+        hidden_states: (N, S, E)
+        attention_mask: (N, S) with HF semantics (1=keep, 0=pad)
+        """
         batch_size, seq_len, hidden_size = hidden_states.shape
         
         # Create query, key, value
-        query = self.query(hidden_states)
-        key = self.key(hidden_states)
-        value = self.value(hidden_states)
+        query = self.query(hidden_states)   # (N, S, E)
+        key   = self.key(hidden_states)     # (N, S, E)
+        value = self.value(hidden_states)   # (N, S, E)
         
-        # Apply attention mask
-        if attention_mask is not None:
-            # Convert attention mask to key padding mask format
-            key_padding_mask = ~attention_mask.bool()
-        else:
-            key_padding_mask = None
+        # Convert to key_padding_mask (True=PAD)
+        key_padding_mask = to_key_padding_mask(attention_mask)  # (N, S) bool or None
             
-        # Multi-head attention
-        attn_output, _ = self.attention(query, key, value, key_padding_mask=key_padding_mask)
+        # Multi-head self-attention pooling over the sequence
+        attn_output, _ = self.attention(
+            query, key, value, key_padding_mask=key_padding_mask
+        )  # (N, S, E)
         
-        # Apply output projection and dropout
-        pooled = self.output_proj(attn_output.mean(dim=1))  # Mean pooling over sequence
+        # Mean pool across sequence (on attn_output)
+        pooled = self.output_proj(attn_output.mean(dim=1))  # (N, E)
         pooled = self.dropout(pooled)
-        
         return pooled
+
 
 class CrossAttentionModule(nn.Module):
     """Cross-attention module for multi-task learning"""
     def __init__(self, hidden_size, num_heads=4, dropout=0.1):
         super().__init__()
-        self.attention = nn.MultiheadAttention(hidden_size, num_heads, dropout=dropout, batch_first=True)
+        self.attention = nn.MultiheadAttention(
+            hidden_size, num_heads, dropout=dropout, batch_first=True
+        )
         self.norm1 = nn.LayerNorm(hidden_size)
         self.norm2 = nn.LayerNorm(hidden_size)
         self.dropout = nn.Dropout(dropout)
         self.output_proj = nn.Linear(hidden_size, hidden_size)
         
     def forward(self, query, key_value, attention_mask=None):
-        # Cross-attention
-        attn_output, _ = self.attention(query, key_value, key_value, key_padding_mask=attention_mask)
+        """
+        query: (N, E) or (N, 1, E)
+        key_value: (N, S, E)
+        attention_mask: (N, S) with HF semantics (1=keep, 0=pad)
+        returns: (N, 1, E)  (caller may squeeze to (N, E))
+        """
+        # Ensure query is 3D (N, 1, E)
+        if query.dim() == 2:
+            query = query.unsqueeze(1)
+        elif query.dim() == 3:
+            # keep as is (N, 1, E) or (N, Q, E); key_padding_mask masks keys, not queries
+            pass
+        else:
+            raise ValueError(f"CrossAttentionModule query must be (N,E) or (N,1,E); got {tuple(query.shape)}")
         
-        # Residual connection and normalization
-        query = self.norm1(query + self.dropout(attn_output))
+        # Convert HF mask -> key_padding_mask
+        key_padding_mask = to_key_padding_mask(attention_mask)  # (N, S) bool
         
-        # Output projection
-        output = self.output_proj(query)
-        output = self.norm2(output + self.dropout(output))
+        # Cross-attention (query attends over key/value sequence)
+        attn_output, _ = self.attention(
+            query, key_value, key_value, key_padding_mask=key_padding_mask
+        )  # (N, 1, E)
         
-        return output
+        # Residual connection and normalization on the query path
+        x = self.norm1(query + self.dropout(attn_output))  # (N, 1, E)
+        
+        # MLP/projection + second residual
+        y = self.output_proj(x)                             # (N, 1, E)
+        y = self.norm2(y + self.dropout(y))                # (N, 1, E)
+        return y
+
 
 class GatedResidualConnection(nn.Module):
     """Gated residual connection for better gradient flow"""
@@ -74,6 +118,7 @@ class GatedResidualConnection(nn.Module):
         gate = self.gate(x)
         return gate * x + (1 - gate) * residual
 
+
 class EnhancedClassifier(nn.Module):
     """Enhanced classifier with skip connections and advanced regularization"""
     def __init__(self, input_size, hidden_sizes, output_size, dropout=0.3):
@@ -82,7 +127,6 @@ class EnhancedClassifier(nn.Module):
         self.gates = nn.ModuleList()
         self.layer_norms = nn.ModuleList()
         
-        # Build layers with skip connections
         prev_size = input_size
         for hidden_size in hidden_sizes:
             self.layers.append(nn.Linear(prev_size, hidden_size))
@@ -90,27 +134,23 @@ class EnhancedClassifier(nn.Module):
             self.layer_norms.append(nn.LayerNorm(hidden_size))
             prev_size = hidden_size
             
-        # Output layer
         self.output_layer = nn.Linear(prev_size, output_size)
         self.dropout = nn.Dropout(dropout)
         
     def forward(self, x):
         residual = x
-        
         for layer, gate, norm in zip(self.layers, self.gates, self.layer_norms):
             x = layer(x)
-            x = F.gelu(x)  # GELU activation for better performance
+            x = F.gelu(x)
             x = self.dropout(x)
             x = norm(x)
-            
-            # Apply gated residual connection if dimensions match
+            # Only apply gated residual when dims match
             if x.shape == residual.shape:
                 x = gate(x, residual)
-            
             residual = x
-            
         output = self.output_layer(x)
         return output
+
 
 class EnhancedBertMultiLabelClassifier(nn.Module):
     """Enhanced BanglaBERT model with advanced architecture improvements"""
@@ -143,7 +183,6 @@ class EnhancedBertMultiLabelClassifier(nn.Module):
                 output_size=1,
                 dropout=dropout
             )
-            
             # Emotion classifier (3-class)
             self.emotion_classifier = EnhancedClassifier(
                 self.hidden_size,
@@ -162,7 +201,7 @@ class EnhancedBertMultiLabelClassifier(nn.Module):
         
         # Advanced regularization components
         self.layer_dropout = nn.Dropout(dropout)
-        self.stochastic_depth = config.stochastic_depth if hasattr(config, 'stochastic_depth') else 0.1
+        self.stochastic_depth = getattr(config, 'stochastic_depth', 0.1) if config is not None else 0.1
         
         # Initialize weights
         self._init_weights()
@@ -171,7 +210,6 @@ class EnhancedBertMultiLabelClassifier(nn.Module):
         """Initialize weights with better initialization strategies"""
         for module in self.modules():
             if isinstance(module, nn.Linear):
-                # Xavier/Glorot initialization for better gradient flow
                 nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
@@ -180,84 +218,67 @@ class EnhancedBertMultiLabelClassifier(nn.Module):
                 nn.init.zeros_(module.bias)
                 
     def apply_stochastic_depth(self, x, survival_prob):
-        """Apply stochastic depth for regularization"""
-        if not self.training or survival_prob == 1.0:
+        """Apply stochastic depth for regularization (per-example)"""
+        if (not self.training) or survival_prob >= 1.0:
             return x
-            
-        # Generate random mask
-        batch_size = x.shape[0]
-        random_tensor = torch.rand(batch_size, 1, device=x.device) < survival_prob
-        
-        # Scale output to maintain expected value
-        return x * random_tensor.float() / survival_prob
+        # Generate per-sample mask (broadcast along features)
+        keep = (torch.rand(x.shape[0], 1, device=x.device) < survival_prob).float()
+        return x * keep / survival_prob
         
     def forward(self, input_ids, attention_mask=None, labels=None):
-        # Get BERT outputs
-        bert_outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
-        sequence_output = bert_outputs.last_hidden_state
+        # BERT encoder
+        bert_outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
+        sequence_output = bert_outputs.last_hidden_state  # (N, S, E)
         
-        # Apply attention pooling instead of [CLS] token
-        pooled_output = self.attention_pooling(sequence_output, attention_mask)
+        # Attention pooling (uses proper key_padding_mask internally)
+        pooled_output = self.attention_pooling(sequence_output, attention_mask)  # (N, E)
         
-        # Apply stochastic depth for regularization
+        # Stochastic depth
         pooled_output = self.apply_stochastic_depth(pooled_output, 1.0 - self.stochastic_depth)
         
         if self.multi_task:
-            # Multi-task learning with cross-attention
-            hate_features = self.hate_cross_attention(
-                pooled_output, sequence_output, attention_mask
-            )
-            emotion_features = self.emotion_cross_attention(
-                pooled_output, sequence_output, attention_mask
-            )
+            # Cross-attend from a single-token query derived from pooled_output
+            hate_ctx   = self.hate_cross_attention(pooled_output, sequence_output, attention_mask)   # (N, 1, E)
+            emotion_ctx= self.emotion_cross_attention(pooled_output, sequence_output, attention_mask) # (N, 1, E)
+            
+            # Squeeze back to (N, E)
+            hate_ctx    = hate_ctx.squeeze(1)
+            emotion_ctx = emotion_ctx.squeeze(1)
             
             # Task-specific classification
-            hate_logits = self.hate_classifier(hate_features)
-            emotion_logits = self.emotion_classifier(emotion_features)
+            hate_logits    = self.hate_classifier(hate_ctx)       # (N, 1)
+            emotion_logits = self.emotion_classifier(emotion_ctx) # (N, 3)
             
             # Combine logits
-            logits = torch.cat([hate_logits, emotion_logits], dim=1)
+            logits = torch.cat([hate_logits, emotion_logits], dim=1)  # (N, 4)
             
-            # Compute loss
             loss = None
             if labels is not None:
                 # Binary cross entropy for HateSpeech
                 hate_loss_fct = nn.BCEWithLogitsLoss()
-                hate_loss = hate_loss_fct(hate_logits, labels[:, :1])
+                hate_targets = labels[:, :1].float()
+                hate_loss = hate_loss_fct(hate_logits, hate_targets)
                 
                 # Cross entropy for Emotion (multi-class)
                 emotion_loss_fct = nn.CrossEntropyLoss()
-                
-                # Extract and validate emotion labels
                 emotion_labels = labels[:, 1].long()
-                emotion_labels = torch.clamp(emotion_labels, 0, 2)
+                emotion_labels = torch.clamp(emotion_labels, 0, 2)  # ensure in range [0,2]
+                emotion_loss = emotion_loss_fct(emotion_logits, emotion_labels)
                 
-                # Ensure labels are within valid range
-                if torch.any(emotion_labels < 0) or torch.any(emotion_labels >= 3):
-                    emotion_labels = torch.where(emotion_labels < 0, torch.zeros_like(emotion_labels), emotion_labels)
-                    emotion_labels = torch.where(emotion_labels >= 3, torch.full_like(emotion_labels, 2), emotion_labels)
-                
-                # Compute emotion loss only if labels are valid
-                if torch.any(emotion_labels < 0) or torch.any(emotion_labels >= 3):
-                    loss = hate_loss
-                else:
-                    emotion_loss = emotion_loss_fct(emotion_logits, emotion_labels)
-                    # Combined loss with configurable weights
-                    hate_weight = getattr(self.config, 'hate_speech_loss_weight', 0.6)
-                    emotion_weight = getattr(self.config, 'emotion_loss_weight', 0.4)
-                    loss = hate_weight * hate_loss + emotion_weight * emotion_loss
+                hate_weight = float(getattr(self.config, 'hate_speech_loss_weight', 0.6)) if self.config is not None else 0.6
+                emotion_weight = float(getattr(self.config, 'emotion_loss_weight', 0.4)) if self.config is not None else 0.4
+                loss = hate_weight * hate_loss + emotion_weight * emotion_loss
                     
         else:
             # Single task classification
-            logits = self.classifier(pooled_output)
-            
-            # Compute loss
+            logits = self.classifier(pooled_output)  # (N, num_labels)
             loss = None
             if labels is not None:
                 loss_fct = nn.BCEWithLogitsLoss()
-                loss = loss_fct(logits, labels)
+                loss = loss_fct(logits, labels.float())
         
         return {'loss': loss, 'logits': logits} if loss is not None else logits
+
 
 class BertMultiLabelClassifier(nn.Module):
     """Original model for backward compatibility"""
@@ -295,66 +316,45 @@ class BertMultiLabelClassifier(nn.Module):
                     module.bias.data.zero_()
 
     def forward(self, input_ids, attention_mask=None, labels=None):
-        outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
-        
-        # Use [CLS] token representation
-        cls_output = outputs.last_hidden_state[:, 0, :]
-        
-        # Get logits from classifier
-        logits = self.classifier(cls_output)
+        outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
+        cls_output = outputs.last_hidden_state[:, 0, :]  # (N, E)
+        logits = self.classifier(cls_output)             # (N, num_labels)
         
         loss = None
         if labels is not None:
-            # Use different loss functions for different tasks
             if self.multi_task:
                 # Binary cross entropy for HateSpeech
                 hate_loss_fct = nn.BCEWithLogitsLoss()
-                hate_loss = hate_loss_fct(logits[:, :1], labels[:, :1])
+                hate_targets = labels[:, :1].float()
+                hate_loss = hate_loss_fct(logits[:, :1], hate_targets)
                 
                 # Cross entropy for Emotion (multi-class)
                 emotion_loss_fct = nn.CrossEntropyLoss()
-                
-                # Extract and validate emotion labels
                 emotion_labels = labels[:, 1].long()
-                
-                # Ensure labels are within valid range [0, 2] for 3 emotion classes
                 emotion_labels = torch.clamp(emotion_labels, 0, 2)
+                emotion_logits = logits[:, 1:]  # (N, 3)
+                emotion_loss = emotion_loss_fct(emotion_logits, emotion_labels)
                 
-                # Final validation after clamping
-                if torch.any(emotion_labels < 0) or torch.any(emotion_labels >= 3):
-                    # Emergency fix - set all invalid labels to valid values
-                    emotion_labels = torch.where(emotion_labels < 0, torch.zeros_like(emotion_labels), emotion_labels)
-                    emotion_labels = torch.where(emotion_labels >= 3, torch.full_like(emotion_labels, 2), emotion_labels)
-                
-                # Ensure logits and labels have compatible shapes
-                emotion_logits = logits[:, 1:]  # Should be [batch_size, 3]
-                
-                # One final safety check before computing loss
-                if torch.any(emotion_labels < 0) or torch.any(emotion_labels >= 3):
-                    # Use only hate speech loss if emotion labels are still invalid
-                    loss = hate_loss
-                else:
-                    # Compute emotion loss only if labels are valid
-                    emotion_loss = emotion_loss_fct(emotion_logits, emotion_labels)
-                    # Combined loss with weights
-                    loss = self.config.hate_speech_loss_weight * hate_loss + self.config.emotion_loss_weight * emotion_loss
+                hate_w = float(getattr(self.config, 'hate_speech_loss_weight', 0.6)) if self.config is not None else 0.6
+                emo_w  = float(getattr(self.config, 'emotion_loss_weight', 0.4)) if self.config is not None else 0.4
+                loss = hate_w * hate_loss + emo_w * emotion_loss
             else:
-                # Fallback to BCE for multi-label
                 loss_fct = nn.BCEWithLogitsLoss()
-                loss = loss_fct(logits, labels)
+                loss = loss_fct(logits, labels.float())
         
         return {'loss': loss, 'logits': logits} if loss is not None else logits
 
+
+# -----------------------------
+# Freezing utilities
+# -----------------------------
 def freeze_base_layers(model):
     """Freeze BERT base layers with selective unfreezing"""
-    # Freeze all BERT layers initially
     for param in model.bert.parameters():
         param.requires_grad = False
-    
     # Unfreeze the last 2 layers for better fine-tuning
     for param in model.bert.encoder.layer[-2:].parameters():
         param.requires_grad = True
-    
     # Always unfreeze the pooler layer
     for param in model.bert.pooler.parameters():
         param.requires_grad = True
@@ -366,38 +366,22 @@ def unfreeze_all_layers(model):
 
 def freeze_base_layers_enhanced(model):
     """Enhanced freezing strategy for the new model architecture"""
-    # Freeze BERT base layers
     for param in model.bert.parameters():
         param.requires_grad = False
-    
-    # Unfreeze the last 3 layers for better fine-tuning
     for param in model.bert.encoder.layer[-3:].parameters():
         param.requires_grad = True
-    
-    # Unfreeze pooler layer
     for param in model.bert.pooler.parameters():
         param.requires_grad = True
     
-    # Always keep attention and classifier layers trainable
-    for param in model.attention_pooling.parameters():
-        param.requires_grad = True
-    
-    if hasattr(model, 'hate_cross_attention'):
-        for param in model.hate_cross_attention.parameters():
-            param.requires_grad = True
-    
-    if hasattr(model, 'emotion_cross_attention'):
-        for param in model.emotion_cross_attention.parameters():
-            param.requires_grad = True
-    
-    if hasattr(model, 'hate_classifier'):
-        for param in model.hate_classifier.parameters():
-            param.requires_grad = True
-    
-    if hasattr(model, 'emotion_classifier'):
-        for param in model.emotion_classifier.parameters():
-            param.requires_grad = True
-    
-    if hasattr(model, 'classifier'):
-        for param in model.classifier.parameters():
-            param.requires_grad = True
+    # Keep task heads & attention trainable
+    for m in [
+        getattr(model, 'attention_pooling', None),
+        getattr(model, 'hate_cross_attention', None),
+        getattr(model, 'emotion_cross_attention', None),
+        getattr(model, 'hate_classifier', None),
+        getattr(model, 'emotion_classifier', None),
+        getattr(model, 'classifier', None),
+    ]:
+        if m is not None:
+            for p in m.parameters():
+                p.requires_grad = True

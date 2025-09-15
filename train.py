@@ -370,7 +370,7 @@ def _assert_batch_ok(batch: Dict[str, torch.Tensor], num_emotion_classes: int = 
 def train_epoch(model, dataloader, optimizer, scheduler, device, class_weights=None, use_amp: bool = False):
     model.train()
     total_loss = 0.0
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     for batch in tqdm(dataloader, desc='Training'):
         _assert_batch_ok(batch)
@@ -380,7 +380,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, class_weights=N
 
         optimizer.zero_grad(set_to_none=True)
 
-        with torch.cuda.amp.autocast(enabled=use_amp):
+        with torch.amp.autocast("cuda", enabled=use_amp):
             outputs = model(input_ids, attention_mask=attention_mask, labels=labels)
             loss = outputs['loss']
 
